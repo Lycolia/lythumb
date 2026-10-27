@@ -1,4 +1,4 @@
-/*! Lythumb-viewer v1.1.0 — dependency-free image viewer | Copyright 2026 Lycolia Rizzim | AGPL-3.0 */
+/*! Lythumb-viewer v1.2.0 — dependency-free image and video viewer | Copyright 2026 Lycolia Rizzim | AGPL-3.0 */
 (function (global) {
   'use strict';
   /*! Icons: Material Symbols | Copyright Google LLC | Apache-2.0 | https://www.apache.org/licenses/LICENSE-2.0 */
@@ -9,9 +9,27 @@
   // Fractional offsets put pixels between device pixels and blur the image, so land on whole device pixels.
   const snap = (n, origin=0) => { const d = devicePixelRatio || 1; return Math.round((n+origin)*d)/d - origin; };
   const TAP_DELAY = 300, IDLE_SECONDS = 3, DURATION = 366, GUTTER = 50, SWIPE_DURATION = 300;
+  const VIDEO = /\.(mp4|webm|mov|m4v|ogv)$/i, YOUTUBE = 'https://www.youtube-nocookie.com';
+  // Accepts watch, youtu.be, Shorts, live and embed URLs. Keeps the start time and playlist; drops the rest, such as si=.
+  const youtube = href => {
+    let u; try { u = new URL(href, document.baseURI); } catch { return null; }
+    const host = u.hostname.replace(/^(www|m)\./, ''), path = u.pathname.split('/').filter(Boolean);
+    let id = null;
+    if (host === 'youtu.be') id = path[0];
+    else if (host === 'youtube.com' || host === 'youtube-nocookie.com') id = path[0] === 'watch' ? u.searchParams.get('v') : ['shorts','live','embed','v'].includes(path[0]) ? path[1] : null;
+    if (!/^[\w-]{11}$/.test(id || '')) return null;
+    const t = (u.searchParams.get('t') ?? u.searchParams.get('start') ?? '').match(/^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s?)?$/);
+    return {type:'youtube', id, shorts: path[0] === 'shorts', start: t ? (+t[1]||0)*3600 + (+t[2]||0)*60 + (+t[3]||0) : 0, list: u.searchParams.get('list')};
+  };
+  const embed = (m, autoplay) => {
+    const q = new URLSearchParams({rel:'0', playsinline:'1', enablejsapi:'1'});
+    if (autoplay) q.set('autoplay', '1'); if (m.start) q.set('start', m.start); if (m.list) q.set('list', m.list);
+    if (/^https?:$/.test(location.protocol)) q.set('origin', location.origin);
+    return `${YOUTUBE}/embed/${m.id}?${q}`;
+  };
   class Viewer {
     constructor() {
-      this.root = null; this.points = new Map(); this.serial = 0;
+      this.root = null; this.points = new Map(); this.serial = 0; this.sizes = new WeakMap();
       this.boundClick = e => {
         const a = e.target.closest?.('a[data-lythumb][href]');
         if (!a || e.defaultPrevented || e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
@@ -22,7 +40,25 @@
       this.boundResize = () => { cancelAnimationFrame(this.resizeFrame); this.resizeFrame = requestAnimationFrame(() => this.refit()); };
       this.boundOrientation = () => { clearTimeout(this.resizeTimer); this.resizeTimer = setTimeout(() => this.refit(), touchUI() ? 600 : 250); };
     }
-    safe(src) { try { return ['http:', 'https:', 'file:', 'blob:'].includes(new URL(src, document.baseURI).protocol) || /^data:image\//i.test(src); } catch { return false; } }
+    safe(src) { try { return ['http:', 'https:', 'file:', 'blob:'].includes(new URL(src, document.baseURI).protocol) || /^data:(image|video)\//i.test(src); } catch { return false; } }
+    // data-lythumb-type wins; otherwise the kind is guessed from the URL.
+    media(a) {
+      const type = a.dataset.lythumbType;
+      if (!type || type === 'youtube') { const m = youtube(a.href); if (m) return m; }
+      let path = ''; try { path = new URL(a.href, document.baseURI).pathname; } catch { /* left as an image */ }
+      return {type: type === 'video' || !type && VIDEO.test(path) ? 'video' : 'image'};
+    }
+    // Still picture for a link: its own thumbnail, else YouTube's.
+    poster(a, m = this.media(a)) { const img = a.querySelector('img'); return img && (img.currentSrc || img.src) || (m.type === 'youtube' ? `https://i.ytimg.com/vi/${m.id}/mqdefault.jpg` : ''); }
+    // The embed cannot report its size: Shorts are portrait, the rest 16:9, unless data-width/data-height give the ratio.
+    frameSize(a, m) { const w = +a.dataset.width, h = +a.dataset.height; return w > 0 && h > 0 ? {w:1600, h:1600*h/w} : m.shorts ? {w:900, h:1600} : {w:1600, h:900}; }
+    // Silence a player at once instead of letting it play on through the fade-out.
+    stop(el, unload = false) {
+      if (el instanceof HTMLVideoElement) { el.pause(); if (unload) { el.removeAttribute('src'); el.load(); } }
+      else if (el instanceof HTMLIFrameElement) try { el.contentWindow?.postMessage('{"event":"command","func":"pauseVideo","args":""}', YOUTUBE); } catch { /* not loaded yet */ }
+    }
+    // Autoplay with sound can be refused; muted playback usually is not.
+    play(video) { video.play()?.catch?.(() => { if (video === this.image && !this.closing) { video.muted = true; video.play()?.catch?.(() => {}); } }); }
     init() {
       if (this.initialized) return this;
       this.initialized = true;
@@ -53,14 +89,15 @@
       if (this.root || !a?.matches?.('a[data-lythumb][href]') || !this.safe(a.href)) return;
       this.trigger = a; this.key = a.dataset.lythumb || '';
       this.items = this.key ? this.links().filter(x => x.dataset.lythumb === this.key) : [a];
-      this.index = this.items.indexOf(a); this.closing = false; this.createdHistory = false;
+      this.index = this.items.indexOf(a); this.closing = false; this.createdHistory = false; this.autoplay = !fromHash;
+      const mixed = this.items.some(x => this.media(x).type !== 'image'); this.unit = mixed ? '件目' : '枚目';
       this.directHash = fromHash; this.originalURL = fromHash ? location.pathname + location.search : location.href; this.thumbsOpen = false; this.points.clear(); this.gesture = null;
       this.controlsHidden = false; this.isIdle = false; this.idleCount = 0; this.tapTimer = null;
       this.abort = new AbortController(); const signal = this.abort.signal;
       this.root = document.createElement('div'); this.root.className = 'lythumb';
       this.root.setAttribute('role', 'dialog'); this.root.setAttribute('aria-modal', 'true');
-      this.root.setAttribute('aria-label', '画像ビューアー'); this.root.tabIndex = -1;
-      this.root.innerHTML = `<div class="lythumb-bg"></div><div class="lythumb-count"></div><div class="lythumb-toolbar"><button type="button" data-action="zoom" aria-label="原寸表示へ切り替え" title="原寸表示へ切り替え"><span class="lythumb-zoom-in">${icons['zoom-in']}</span><span class="lythumb-zoom-out" hidden>${icons['zoom-out']}</span></button><button type="button" data-action="thumbs" aria-label="サムネイル一覧" aria-expanded="false" title="サムネイル一覧">${icons.list}</button><button type="button" data-action="close" aria-label="閉じる" title="閉じる">${icons.close}</button></div><div class="lythumb-stage"><div class="lythumb-track"></div><div class="lythumb-status" role="status"></div></div><button type="button" class="lythumb-prev" data-action="prev" aria-label="前の画像">${icons.prev}</button><button type="button" class="lythumb-next" data-action="next" aria-label="次の画像">${icons.next}</button><div class="lythumb-caption"></div><div class="lythumb-thumbs" hidden></div><div class="lythumb-sr" aria-live="polite" aria-atomic="true"></div>`;
+      this.root.setAttribute('aria-label', mixed ? 'メディアビューアー' : '画像ビューアー'); this.root.tabIndex = -1;
+      this.root.innerHTML = `<div class="lythumb-bg"></div><div class="lythumb-count"></div><div class="lythumb-toolbar"><button type="button" data-action="zoom" aria-label="原寸表示へ切り替え" title="原寸表示へ切り替え"><span class="lythumb-zoom-in">${icons['zoom-in']}</span><span class="lythumb-zoom-out" hidden>${icons['zoom-out']}</span></button><button type="button" data-action="thumbs" aria-label="サムネイル一覧" aria-expanded="false" title="サムネイル一覧">${icons.list}</button><button type="button" data-action="close" aria-label="閉じる" title="閉じる">${icons.close}</button></div><div class="lythumb-stage"><div class="lythumb-track"></div><div class="lythumb-status" role="status"></div></div><button type="button" class="lythumb-prev" data-action="prev" aria-label="${mixed ? '前へ' : '前の画像'}">${icons.prev}</button><button type="button" class="lythumb-next" data-action="next" aria-label="${mixed ? '次へ' : '次の画像'}">${icons.next}</button><div class="lythumb-caption"></div><div class="lythumb-thumbs" hidden></div><div class="lythumb-sr" aria-live="polite" aria-atomic="true"></div>`;
       this.bg = this.root.querySelector('.lythumb-bg');
       this.stage = this.root.querySelector('.lythumb-stage'); this.track = this.root.querySelector('.lythumb-track'); this.peers = new Map(); this.trackOffset = 0; this.status = this.root.querySelector('.lythumb-status');
       this.caption = this.root.querySelector('.lythumb-caption'); this.thumbs = this.root.querySelector('.lythumb-thumbs');
@@ -98,7 +135,7 @@
       document.addEventListener('keydown', e => this.keydown(e), {signal});
       window.addEventListener('resize', this.boundResize, {signal});
       window.addEventListener('orientationchange', this.boundOrientation, {signal});
-      this.buildThumbs(); this.show(this.index, !fromHash);
+      this.buildThumbs(); this.show(this.index, !fromHash); this.autoplay = true;
       requestAnimationFrame(() => { if (this.root && !this.closing) this.root.classList.add('is-open'); });
       // Focus the dialog itself so arrow-key paging does not light up a button.
       this.root.focus({preventScroll:true});
@@ -110,9 +147,9 @@
       this.root.querySelector('[data-action=thumbs]').hidden = !multi;
       this.items.forEach((a, i) => {
         const b = document.createElement('button'); b.type = 'button'; b.className = 'lythumb-thumb'; b.dataset.index = i;
-        b.setAttribute('aria-label', `${i+1}枚目を表示`);
-        const original = a.querySelector('img');
-        if (original) { const img = document.createElement('img'); img.src = original.currentSrc || original.src; img.alt = ''; img.loading = 'lazy'; b.append(img); }
+        b.setAttribute('aria-label', `${i+1}${this.unit}を表示`);
+        const src = this.poster(a);
+        if (src || a.querySelector('img')) { const img = document.createElement('img'); img.src = src; img.alt = ''; img.loading = 'lazy'; b.append(img); }
         else b.textContent = String(i+1);
         this.thumbs.append(b);
       });
@@ -122,45 +159,68 @@
       if (this.current && this.index === index) return;
       if (!slide) { this.finishSlide(); this.setTrack(0); this.clearPeers(); }
       const firstImage = !this.current, incoming = slide && this.peers.get(slide.dir);
-      this.index = index; this.current = this.items[index]; const token = ++this.serial;
+      this.index = index; this.current = this.items[index]; const token = ++this.serial, autoplay = this.autoplay;
+      const m = this.media(this.current), what = m.type === 'image' ? '画像' : '動画';
       this.points.clear(); this.gesture = null; this.root.classList.remove('is-dragging');
       clearTimeout(this.loadingTimer); if (slide) this.carry(slide); else this.retire(); this.ready = false; this.image = null;
-      this.zoomButton.disabled = true; this.setStatus('');
+      // Videos have no zoom, and fill the stage even past their own size.
+      this.zoomable = m.type === 'image'; this.upscale = !this.zoomable;
+      this.zoomButton.disabled = true; this.zoomButton.hidden = !this.zoomable; this.setStatus('');
       this.caption.textContent = this.current.dataset.caption ?? this.current.querySelector('img')?.getAttribute('alt') ?? ''; this.caption.hidden = !this.caption.textContent;
       this.root.querySelector('.lythumb-count').textContent = `${index+1} / ${this.items.length}`;
       this.prev.disabled = index === 0; this.next.disabled = index === this.items.length-1;
       [...this.thumbs.children].forEach((b,i) => b.setAttribute('aria-current', String(i===index)));
       if (this.thumbsOpen) this.thumbs.children[index].scrollIntoView({block:'nearest'});
-      if (this.root.contains(document.activeElement) && document.activeElement.disabled) this.root.focus({preventScroll:true});
+      // The outgoing player is inert now, so take focus off it as well as off disabled buttons.
+      const focused = document.activeElement;
+      if (this.root.contains(focused) && (focused.disabled || this.track.contains(focused))) this.root.focus({preventScroll:true});
       this.layout();
       const alt = this.current.querySelector('img')?.getAttribute('alt') || this.caption.textContent;
-      const reveal = (img, animate) => {
+      const reveal = (el, w, h, animate) => {
         clearTimeout(this.loadingTimer); this.ready = true; this.setStatus('');
-        img.onload = img.onerror = null; img.className = 'lythumb-image'; img.alt = alt; img.style.pointerEvents = '';
-        this.image = img; this.width = img.naturalWidth; this.height = img.naturalHeight;
-        if (!img.isConnected) this.track.prepend(img);
+        el.onload = el.onerror = el.onloadedmetadata = null; el.className = this.zoomable ? 'lythumb-image' : 'lythumb-image lythumb-media'; el.style.pointerEvents = '';
+        if (el instanceof HTMLImageElement) el.alt = alt;
+        this.image = el; this.width = w; this.height = h; this.sizes.set(el, {w, h, up: this.upscale});
+        if (!el.isConnected) this.track.prepend(el);
         this.layout(); this.fitImage(); if (animate) this.animateImage(firstImage);
         this.root.querySelector('[aria-live]').textContent = `${index+1} / ${this.items.length} ${alt}`;
         this.preload();
       };
+      if (historyUpdate) this.scheduleHistory();
       // A swiped-in neighbour that has already loaded becomes the current image without a fade.
-      if (incoming?.isConnected && incoming.naturalWidth) { reveal(incoming, false); if (historyUpdate) this.scheduleHistory(); return; }
+      if (m.type === 'image' && incoming?.isConnected && incoming.naturalWidth) { reveal(incoming, incoming.naturalWidth, incoming.naturalHeight, false); return; }
       incoming?.remove();
+      if (m.type === 'youtube') {
+        const frame = document.createElement('iframe'); frame.title = alt || 'YouTube動画';
+        frame.setAttribute('allow', 'autoplay; encrypted-media; fullscreen; picture-in-picture'); frame.setAttribute('allowfullscreen', '');
+        frame.setAttribute('referrerpolicy', 'strict-origin-when-cross-origin'); frame.src = embed(m, autoplay);
+        const {w, h} = this.frameSize(this.current, m); reveal(frame, w, h, true); return;
+      }
+      const failed = () => {
+        if (token !== this.serial || this.closing || !this.root) return;
+        clearTimeout(this.loadingTimer); this.setStatus(`${what}を読み込めませんでした。`, 'is-error');
+        this.root.querySelector('[aria-live]').textContent = `${index+1}${this.unit}の${what}を読み込めませんでした。`;
+      };
+      this.loadingTimer = setTimeout(() => { if (token === this.serial && !this.ready && this.root) this.setStatus('読み込み中…', 'is-loading'); },50);
+      if (m.type === 'video') {
+        const video = document.createElement('video'); video.controls = true; video.preload = 'metadata';
+        video.setAttribute('playsinline', ''); video.setAttribute('aria-label', alt);
+        const poster = this.poster(this.current, m); if (poster) video.poster = poster;
+        this.image = video;
+        // An audio-only file has no picture size; give it a 16:9 box for its controls.
+        video.onloadedmetadata = () => { if (token !== this.serial || this.closing || !this.root) return; reveal(video, video.videoWidth || 1600, video.videoHeight || 900, true); if (autoplay) this.play(video); };
+        video.onerror = failed; video.src = this.current.href; return;
+      }
       const img = new Image(); img.className = 'lythumb-image'; img.alt = alt; img.draggable = false;
       this.image = img;
-      this.loadingTimer = setTimeout(() => { if (token === this.serial && !this.ready && this.root) this.setStatus('読み込み中…', 'is-loading'); },50);
-      img.onload = () => { if (token === this.serial && !this.closing && this.root) reveal(img, true); };
-      img.onerror = () => {
-        if (token !== this.serial || this.closing || !this.root) return;
-        clearTimeout(this.loadingTimer); this.setStatus('画像を読み込めませんでした。', 'is-error');
-        this.root.querySelector('[aria-live]').textContent = `${index+1}枚目の画像を読み込めませんでした。`;
-      };
+      img.onload = () => { if (token === this.serial && !this.closing && this.root) reveal(img, img.naturalWidth, img.naturalHeight, true); };
+      img.onerror = failed;
       img.src = this.current.href;
-      if (historyUpdate) this.scheduleHistory();
     }
     setStatus(text, state) { this.status.textContent = text; this.status.className = `lythumb-status${state ? ' '+state : ''}`; }
     retire() {
       const old = this.image; if (!old) return;
+      this.stop(old, !this.ready); old.inert = true;
       if (!this.ready || reduced() || !old.animate) { old.remove(); return; }
       old.style.pointerEvents = 'none';
       old.animate([{opacity:1},{opacity:0}],{duration:DURATION,easing:'cubic-bezier(.19,1,.22,1)',fill:'forwards'}).onfinish = () => old.remove();
@@ -185,14 +245,20 @@
       this.clearPeers();
       [-1, 1].forEach(slot => {
         const item = this.items[this.index+slot]; if (!item) return;
-        const img = new Image(); img.className = 'lythumb-image lythumb-peer'; img.alt = ''; img.draggable = false; img.style.visibility = 'hidden';
-        img.onload = () => { if (this.peers.get(slot) === img) this.placePeer(img, slot); };
-        this.peers.set(slot, img); this.track.append(img); img.src = item.href;
-        if (img.complete && img.naturalWidth) this.placePeer(img, slot);
+        // A video neighbour is stood in for by its poster, sized as the video will be; the player itself loads only once shown.
+        const m = this.media(item), src = m.type === 'image' ? item.href : this.poster(item, m); if (!src) return;
+        const img = new Image(); img.className = `lythumb-image lythumb-peer${m.type === 'image' ? '' : ' lythumb-poster'}`; img.alt = ''; img.draggable = false; img.style.visibility = 'hidden';
+        const place = () => {
+          if (m.type !== 'image') this.sizes.set(img, {...(m.type === 'youtube' ? this.frameSize(item, m) : {w: img.naturalWidth, h: img.naturalHeight}), up: true});
+          this.placePeer(img, slot);
+        };
+        img.onload = () => { if (this.peers.get(slot) === img) place(); };
+        this.peers.set(slot, img); this.track.append(img); img.src = src;
+        if (img.complete && img.naturalWidth) place();
       });
     }
     placePeer(img, slot) {
-      const w = img.naturalWidth, h = img.naturalHeight, fit = Math.min(1, this.area.w/w, this.area.h/h);
+      const {w, h, up} = this.sizes.get(img) ?? {w: img.naturalWidth, h: img.naturalHeight}, fit = Math.min(up ? Infinity : 1, this.area.w/w, this.area.h/h);
       img.style.width = `${w*fit}px`; img.style.height = `${h*fit}px`; img.style.transition = 'none'; img.style.visibility = '';
       img.style.transform = `translate(${snap(slot*(this.area.w+GUTTER)+(this.area.w-w*fit)/2,this.area.left)}px,${snap((this.area.h-h*fit)/2,this.area.top)}px)`;
     }
@@ -202,6 +268,7 @@
       const old = this.image, incoming = this.peers.get(slide.dir);
       this.peers.forEach(img => { if (img !== incoming) img.remove(); });
       this.peers = new Map(incoming ? [[slide.dir, incoming]] : []);
+      if (old) { this.stop(old, !this.ready); old.inert = true; }
       if (old && this.ready) { old.classList.add('lythumb-peer'); old.style.pointerEvents = 'none'; this.placePeer(old, -slide.dir); this.peers.set(-slide.dir, old); } else old?.remove();
       this.setTrack(slide.offset + slide.dir*(this.area.w+GUTTER));
       this.slideTrack(0, SWIPE_DURATION, () => this.clearPeers());
@@ -233,7 +300,7 @@
       // Desktop keeps the image clear of the caption; touch layouts let the caption overlap.
       this.stage.style.bottom = !touchUI() && !this.caption.hidden ? `${this.caption.offsetHeight - 50}px` : '';
       const r = this.stage.getBoundingClientRect(); this.area = {w:r.width,h:r.height,left:r.left,top:r.top};
-      if (this.ready) this.fit = Math.min(1,this.area.w/this.width,this.area.h/this.height);
+      if (this.ready) this.fit = Math.min(this.upscale?Infinity:1,this.area.w/this.width,this.area.h/this.height);
     }
     fitImage() { if (!this.ready) return; this.scale = this.fit; this.x = (this.area.w-this.width*this.scale)/2; this.y = (this.area.h-this.height*this.scale)/2; this.render(0); }
     position(x,y,scale) {
@@ -256,14 +323,14 @@
       } else if (live) { clearTimeout(this.renderTimer); this.image.style.transition = 'none'; this.image.style.transform = this.transformAt(this.x,this.y,this.scale); }
       else this.commit();
       const zoomed = this.scale > this.fit + .0001;
-      this.root.classList.toggle('is-zoomed',zoomed); this.zoomButton.disabled = this.fit >= 1;
+      this.root.classList.toggle('is-zoomed',zoomed); this.zoomButton.disabled = !this.zoomable || this.fit >= 1;
       this.zoomButton.querySelector('.lythumb-zoom-in').hidden = zoomed;
       this.zoomButton.querySelector('.lythumb-zoom-out').hidden = !zoomed;
       this.zoomButton.setAttribute('aria-label',zoomed?'画面内に収める':'原寸表示へ切り替え');
       this.zoomButton.title = this.zoomButton.getAttribute('aria-label');
     }
     zoom(cx=this.area?.w/2,cy=this.area?.h/2) {
-      if (!this.ready || this.fit >= 1) return;
+      if (!this.ready || !this.zoomable || this.fit >= 1) return;
       const target = this.scale > this.fit+.0001 ? this.fit : 1, ratio = target/this.scale;
       const p = this.position(cx-(cx-this.x)*ratio,cy-(cy-this.y)*ratio,target);
       this.scale=target; this.x=p.x; this.y=p.y; this.render(DURATION);
@@ -291,7 +358,8 @@
         else if(action==='zoom') this.zoom(); else if(action==='thumbs') this.toggleThumbs(); else if(b.dataset.index!==undefined) this.show(Number(b.dataset.index));
       } else { const kind=this.kind(e.target), r=this.stage.getBoundingClientRect(); if(kind) this.tap(kind,e.clientX-r.left,e.clientY-r.top); }
     }
-    kind(target) { return target===this.image?'content':target===this.stage||target===this.track?'slide':target===this.root||target===this.bg?'outside':null; }
+    // A player handles its own clicks.
+    kind(target) { return target===this.image?(this.zoomable?'content':null):target===this.stage||target===this.track?'slide':target===this.root||target===this.bg?'outside':null; }
     tap(kind,x,y) {
       // Touch layouts wait for a possible second tap, as single and double taps do different things there.
       const touch=touchUI(), single=kind==='content'?(touch?'toggle':'zoom'):'close', double=touch&&kind!=='outside'?'zoom':null;
@@ -302,14 +370,15 @@
       else run(single);
     }
     down(e) {
-      if (this.closing || !this.stage.contains(e.target) || e.button!==0 || e.target===this.status) return;
+      // Pressing on a player is left to its controls, such as dragging the seek bar; swipes start around it.
+      if (this.closing || !this.stage.contains(e.target) || e.button!==0 || e.target===this.status || (!this.zoomable && e.target===this.image)) return;
       e.preventDefault(); if (this.trackTimer) return;
       if (this.trackOffset) { this.setTrack(0); this.clearPeers(); } this.root.focus({preventScroll:true}); this.tapTarget=e.target; this.root.setPointerCapture(e.pointerId); this.points.set(e.pointerId,{x:e.clientX,y:e.clientY});
       this.beginGesture();
     }
     beginGesture() {
       const pts=[...this.points.values()]; if (!pts.length) { this.gesture=null; return; }
-      const mode=pts.length>1?(this.ready?'pinch':null):this.ready&&this.scale>this.fit+.0001?'pan':'swipe';
+      const mode=pts.length>1?(this.ready&&this.zoomable?'pinch':null):this.ready&&this.scale>this.fit+.0001?'pan':'swipe';
       this.gesture={mode,real:pts[0],start:pts[0],time:performance.now(),scale:this.scale,x:this.x,y:this.y,moved:pts.length>1,axis:null,dx:0,dy:0};
       if(mode==='pinch') Object.assign(this.gesture,{mid:{x:(pts[0].x+pts[1].x)/2,y:(pts[0].y+pts[1].y)/2},distance:Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y)});
     }
@@ -391,12 +460,14 @@
     keydown(e) {
       if(!this.root||this.closing)return;
       if(e.key==='Tab') {
-        const f=[...this.root.querySelectorAll('button:not(:disabled),[tabindex="0"]')].filter(x=>x.getClientRects().length&&getComputedStyle(x).visibility!=='hidden');
+        const f=[...this.root.querySelectorAll('button:not(:disabled),[tabindex="0"],video[controls]:not([inert]),iframe:not([inert])')].filter(x=>x.getClientRects().length&&getComputedStyle(x).visibility!=='hidden');
         const i=f.indexOf(document.activeElement); if(!f.length){e.preventDefault();this.root.focus();}
         else if(e.shiftKey&&(i<=0)){e.preventDefault();f.at(-1).focus();}else if(!e.shiftKey&&(i===f.length-1||i<0)){e.preventDefault();f[0].focus();}return;
       }
-      if(e.ctrlKey||e.altKey||e.shiftKey||e.metaKey||e.isComposing||e.target.closest('input,textarea,select,video,audio,[contenteditable]:not([contenteditable=false])'))return;
+      if(e.ctrlKey||e.altKey||e.shiftKey||e.metaKey||e.isComposing)return;
       const key=e.key.toLowerCase();
+      // Escape still closes from a focused player; its other keys belong to the player.
+      if(key!=='escape'&&e.target.closest('input,textarea,select,video,audio,[contenteditable]:not([contenteditable=false])'))return;
       if(['escape','backspace'].includes(key)){e.preventDefault();this.close();}
       else if(['arrowleft','arrowup','arrowright','arrowdown'].includes(key)){e.preventDefault();if(!this.points.size)this.show(this.index+(['arrowleft','arrowup'].includes(key)?-1:1));}
       else if(key==='g'){e.preventDefault();this.toggleThumbs();}
@@ -405,7 +476,7 @@
     async fullscreen() {
       try {if(document.fullscreenElement===this.root)await document.exitFullscreen();else if(this.root.requestFullscreen)await this.root.requestFullscreen();}catch{/* Unsupported or denied: keep viewer usable. */}
     }
-    preload() {this.preloaded=[this.index-1,this.index+1].filter(i=>i>=0&&i<this.items.length).map(i=>{const img=new Image();img.src=this.items[i].href;return img;});}
+    preload() {this.preloaded=[this.index-1,this.index+1].filter(i=>i>=0&&i<this.items.length&&this.media(this.items[i]).type==='image').map(i=>{const img=new Image();img.src=this.items[i].href;return img;});}
     hash() { return '#'+encodeURIComponent(this.key)+(this.items.length>1?'-'+(this.index+1):''); }
     scheduleHistory() {
       clearTimeout(this.historyTimer); if(!this.key)return;
@@ -419,7 +490,7 @@
     close(updateHistory=true, immediate=false, swiped=false) {
       if(!this.root||this.closing)return;
       this.closing=true;++this.serial;clearTimeout(this.historyTimer);clearTimeout(this.renderTimer);clearTimeout(this.loadingTimer);clearTimeout(this.tapTimer);clearTimeout(this.resizeTimer);clearInterval(this.idleTimer);cancelAnimationFrame(this.resizeFrame);
-      this.abort.abort();this.points.clear();
+      this.abort.abort();this.points.clear();if(this.image)this.stop(this.image,!this.ready);
       if(document.fullscreenElement===this.root)document.exitFullscreen?.().catch(()=>{});
       this.finishSlide();
       const root=this.root,duration=swiped?250:DURATION;

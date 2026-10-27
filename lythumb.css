@@ -49,6 +49,18 @@
     cursor: zoom-in
 }
 
+.lythumb-media {
+    display: block;
+    border: 0;
+    background: #000;
+    cursor: auto
+}
+
+.lythumb-poster {
+    object-fit: cover;
+    background: #000
+}
+
 .lythumb.is-zoomed .lythumb-image {
     cursor: grab
 }

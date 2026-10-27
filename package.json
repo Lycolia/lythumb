@@ -1,7 +1,7 @@
 {
   "name": "lythumb-viewer",
-  "version": "1.1.0",
-  "description": "Dependency-free image viewer, lightbox alternative",
+  "version": "1.2.0",
+  "description": "Dependency-free image and video viewer, lightbox alternative",
   "scripts": {
     "test": "node --test tests/lythumb.test.cjs",
     "build": "esbuild lythumb.js --minify --target=es2022 --outfile=dist/lythumb.min.js && esbuild lythumb.css --minify --outfile=dist/lythumb.min.css"
