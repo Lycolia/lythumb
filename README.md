@@ -2,7 +2,7 @@
 
 ページ内のサムネイル画像をクリックしたときに、画像や動画を拡大して表示するビューアーです。
 
-jQuery不要で、JSとCSSのみで動きます。
+jQuery不要で、JSとCSSのみで動きます。LightboxやFancyboxの置き換えを目的に開発しました。
 
 [Fancybox v3.5.7](https://github.com/fancyapps/fancybox)の置き換えを目的に開発しましたが、自分が使う機能のみ実装したため、機能は網羅していません。
 
