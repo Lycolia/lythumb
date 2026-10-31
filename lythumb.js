@@ -1,4 +1,4 @@
-/*! Lythumb-viewer v1.2.0 — dependency-free image and video viewer | Copyright 2026 Lycolia Rizzim | AGPL-3.0 */
+/*! Lythumb v1.2.0 — dependency-free image and video viewer | Copyright 2026 Lycolia Rizzim | AGPL-3.0 */
 (function (global) {
   'use strict';
   /*! Icons: Material Symbols | Copyright Google LLC | Apache-2.0 | https://www.apache.org/licenses/LICENSE-2.0 */

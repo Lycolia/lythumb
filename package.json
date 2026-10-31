@@ -1,6 +1,6 @@
 {
-  "name": "lythumb-viewer",
-  "version": "1.2.0",
+  "name": "lythumb",
+  "version": "1.3.0",
   "description": "Dependency-free image and video viewer, lightbox alternative",
   "scripts": {
     "test": "node --test tests/lythumb.test.cjs",
